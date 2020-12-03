@@ -12,6 +12,11 @@
 #include "pcrf.h"
 #include "session.h"
 #include "statpcrf.h"
+#include "rapidjson/rapidjson.h"
+#include "rapidjson/document.h"
+#include "rapidjson/writer.h"
+#include "rapidjson/prettywriter.h"
+#include "rapidjson/stringbuffer.h"
 
 ////////////////////////////////////////////////////////////////////////////////
 ////////////////////////////////////////////////////////////////////////////////
@@ -608,26 +613,107 @@ void GxIpCan1::onQuit()
 
 void GxIpCan1::onTimer( SEventThread::Timer &t)
 {
-   if (t.getId() == m_idleTimer->getId())
+   if ( t.getId() == m_rarTimer->getId() )
    {
-      postMessage( TIMEOUT );
+      postMessage( RARTIMEOUT );
    }
+	else
+	if ( t.getId() == m_raaTimer->getId() )
+	{
+		postMessage( RAATIMEOUT );
+	}
 }
 
 void GxIpCan1::dispatch( SEventThreadMessage &msg)
 {
-   if ( msg.getId() == TIMEOUT)
+   if ( msg.getId() == RARTIMEOUT)
    {
-      Logger::gx().debug("SOHAN TIMEOUT Occured");
-      sendRAR();
+      Logger::gx().debug("RAR TIMEOUT Occured");
+      sendRAR(true);
    }
+	else
+	if ( msg.getId() == RAATIMEOUT )
+	{
+		Logger::gx().debug("RAA TIMEOUT Occured");
+		sendRAR(false);
+	}
 }
 
-void GxIpCan1::sendRAR()
+void GxIpCan1::rcvdRAA(FDMessageAnswer& ans)
 {
-   Logger::gx().debug("SOHAN SENDING RAR to PEER");
+	Logger::gx().debug("RCVD RAA FROM PEER");
+	gx::ReAuthAnswerExtractor raa( ans, getDict() );
+	ans.dump();
+	
+	// reterive the session id and check it if is valid and it is same as sent in RAR request.
+
+	GxSession *session = NULL;
+	std::string session_id;
+	std::string rule_name;
+	int pcc_status;
+	std::list<gx::ChargingRuleReportExtractor*> l_fd_extractor_list;
+	std::list<FDExtractorAvp*> l_rule_name_list;
+	raa.session_id.get( session_id );	
+   if ( !GxSessionMap::getInstance().findSession( getGxSession()->getSessionId(), session ) )
+   {
+		printf ("SOHAN unkown session id Not sending RAA...\n");
+		return;
+	}
+	printf ("SOHAN RCVD session id : %s\n", session_id.c_str());
+	
+	l_fd_extractor_list = raa.charging_rule_report.getList();
+
+   for(std::list<gx::ChargingRuleReportExtractor*>::iterator iter= l_fd_extractor_list . begin(); iter != l_fd_extractor_list . end(); iter++)
+   {
+		GxChargingRuleReport* rule_report = new GxChargingRuleReport();
+		l_rule_name_list = (*iter)->charging_rule_name.getList();
+		for(std::list<FDExtractorAvp *>::iterator iterAvp= l_rule_name_list.begin(); iterAvp != l_rule_name_list.end(); iterAvp++)
+    	{
+        (*iterAvp)->get( rule_name );
+			printf ("SOHAN : RuleName : %s\n", rule_name.c_str() );
+    	}
+   	//(*iter)->charging_rule_name.get( rule_name );
+		rule_report->setRuleName( rule_name );
+		(*iter)->pcc_rule_status.get( pcc_status );
+		printf ("SOHAN : Status : %d\n", pcc_status );
+		rule_report->setPccStatus( pcc_status );	
+		getGxSession()->getRulesReport().push_back( rule_report );
+   }
+
+	RulesReportList& rlist( getGxSession()->getRulesReport() );
+	bool status = true;
+	if (!rlist.empty())
+	{
+		for (auto r : rlist)
+		{
+			if ( r->getPccStatus() != 0)
+			{
+				status = false;
+			}
+		}
+	}
+
+	if ( status == true )
+	{
+		Logger::gx().debug("STARTING THE TIMER AS RAA is rcvd");
+      m_raaTimer = new SEventThread::Timer(20000, true);
+      initTimer( *m_raaTimer);
+      init(NULL);
+      m_raaTimer->start();	
+	}
+	
+	
+	
+}
+
+void GxIpCan1::sendRAR(bool pending)
+{
+   Logger::gx().debug("SENDING RAR to PEER");
+	int qci, pl, pec, pev;
+   RAPIDJSON_NAMESPACE::Document doc;
    RulesList &irules( getRulesEvaluator().getGxInstallRules() );
    RulesList &rrules( getRulesEvaluator().getGxRemoveRules() );
+	RulesList &prules( getRulesEvaluator().getGxPendingRules() );
 
    gx::GxRulesRARreq *req = new gx::GxRulesRARreq (((getGxSession()->getPCRF()).gxApp()), this);
    req->add( getDict().avpSessionId(), getGxSession()->getSessionId() );
@@ -636,6 +722,7 @@ void GxIpCan1::sendRAR()
    req->add( getDict().avpDestinationRealm(), getGxSession()->getPcefEndpoint()->getRealm() );
    req->add( getDict().avpDestinationHost(), getGxSession()->getPcefEndpoint()->getHost() );
    req->add( getDict().avpReAuthRequestType(), 0 );
+	/*
 
    if ( !irules.empty() )
    {
@@ -697,11 +784,78 @@ void GxIpCan1::sendRAR()
 			req->add( prar );
 		}
 	}
-	FDAvp defBearerQos (getDict().avpDefaultEpsBearerQos());
-	std::string json_t("{\"QoS-Class-Identifier\": 9, \"Allocation-Retention-Priority\": {\"Priority-Level\": 1, \"Pre-emption-Capability\": 2, \"Pre-emption-Vulnerability\": 20}}");
-	defBearerQos.addJson(json_t);
-	req->add(defBearerQos);
+	*/
+	if ( pending == true)
+	{
+  	if ( !prules.empty() )
+	{
+		int crcnt = 0;
+		int pracnt = 0;
+		std::string s_pl;
+		FDAvp crp( getDict().avpChargingRuleInstall() );
+		FDAvp prap( getDict().avpPraInstall() );
+		FDAvp qos_info( getDict().avpQosInformation() ); 
+		
+		for (auto r : prules)
+		{
+			if (r->getType() == "CHARGING")
+			{
+				crp.add( getDict().avpChargingRuleName(), r->getRuleName() );
+				qos_info.addJson(  r->getDefinition() );
+				doc.Parse( r->getDefinition().c_str() );
+				const RAPIDJSON_NAMESPACE::Value& crditem = doc["Charging-Rule-Definition"];
+				for (RAPIDJSON_NAMESPACE::Value::ConstMemberIterator crditr = crditem.MemberBegin(); crditr != crditem.MemberEnd(); ++crditr)
+				{
+					if ( strcmp(crditr->name.GetString(), "QoS-Information") == 0)
+					{
+						qci = crditr->value["QoS-Class-Identifier"].GetInt();
+						const RAPIDJSON_NAMESPACE::Value& arpitem = crditr->value["Allocation-Retention-Priority"];
+						pl = arpitem["Priority-Level"].GetInt();
+						pec = arpitem["Pre-emption-Capability"].GetInt();
+						pev = arpitem["Pre-emption-Vulnerability"].GetInt();
+					}
+				}
+				crcnt++;
+			}
+			else if ( r->getType() == "PRA")
+			{
+				prap.add( getDict().avpPresenceReportingAreaIdentifier(), r->getRuleName());
+				pracnt++;
+			}
+		}
 
+		if (crcnt > 0)
+		{
+			req->add( crp );
+			req->add( qos_info );
+		}
+		if (pracnt > 0)
+		{
+			req->add( prap );
+		}
+
+		prules.clear();
+	}
+	}
+
+	FDAvp avp_qci( getDict().avpQosClassIdentifier() );
+	avp_qci.set( qci );
+
+	FDAvp avp_arp( getDict().avpAllocationRetentionPriority() );
+	avp_arp.add( getDict().avpPriorityLevel(), pl );
+	avp_arp.add( getDict().avpPreEmptionCapability(), pec );
+	avp_arp.add( getDict().avpPreEmptionVulnerability(), pev );
+
+	
+	FDAvp defBearerQos ( getDict().avpDefaultEpsBearerQos());
+	defBearerQos.add( avp_qci );
+	defBearerQos.add( avp_arp );
+	//std::string json_t("{\"QoS-Class-Identifier\": 9, \"Allocation-Retention-Priority\": {\"Priority-Level\": 1, \"Pre-emption-Capability\": 2, \"Pre-emption-Vulnerability\": 20}}");
+	//defBearerQos.addJson(json_t);
+
+	
+	req->add(defBearerQos);
+	req->dump();
 	req->send();
    //bool result = getPCRF().gxApp().sendRulesRARreq(*(getGxSession()), irules, rrules, this);
    //if (result)
@@ -735,13 +889,17 @@ bool GxIpCan1::processPhase1()
    SMutexLock l( m_mutex );
    bool result = true;
    std::string s;
+	std::string r;
 
    setStatus( esProcessing );
 
    while ( result )
    {
       setGxSession( new GxSession( getPCRF() ) );
+		size_t session_list_size = getGxSession()->getRules().size();
 
+
+		printf ("SOHAN : %s:%dSESSION SIZE : %d\n", __FILE__, __LINE__, getGxSession()->getRules().size());
       //
       // find the IMSI
       //
@@ -794,6 +952,7 @@ bool GxIpCan1::processPhase1()
          StatsPcrf::singleton().registerStatResult(stat_pcrf_gx_ccr, 0, DIAMETER_MISSING_AVP);
          ABORT();
       }
+		printf ("SOHAN : %s:%dSESSION SIZE : %d\n", __FILE__, __LINE__, getGxSession()->getRules().size());
 
       //
       // get the APN
@@ -808,6 +967,7 @@ bool GxIpCan1::processPhase1()
       }
 
       getGxSession()->setApn( s );
+		printf ("SOHAN : %s:%dSESSION SIZE : %d\n", __FILE__, __LINE__, getGxSession()->getRules().size());
 
       //
       // return if the APN is invalid
@@ -820,6 +980,8 @@ bool GxIpCan1::processPhase1()
          StatsPcrf::singleton().registerStatResult(stat_pcrf_gx_ccr, VEND_3GPP, DIAMETER_ERROR_INITIAL_PARAMETERS);
          ABORT();
       }
+
+		printf ("SOHAN : %s:%dSESSION SIZE : %d\n", __FILE__, __LINE__, session_list_size);
 
       //
       // lookup the APN and return if it does not exist
@@ -837,6 +999,7 @@ bool GxIpCan1::processPhase1()
 
          getGxSession()->setApnEntry( apn );
       }
+		printf ("SOHAN : %s:%dSESSION SIZE : %d\n", __FILE__, __LINE__, getGxSession()->getRules().size());
 
       //
       // get the session id
@@ -860,6 +1023,7 @@ bool GxIpCan1::processPhase1()
             ABORT();
          }
       }
+		printf ("SOHAN : %s:%dSESSION SIZE : %d\n", __FILE__, __LINE__, getGxSession()->getRules().size());
 
       //
       // see if the session already exists in memory
@@ -876,6 +1040,7 @@ bool GxIpCan1::processPhase1()
             ABORT();
          }
       }
+		printf ("SOHAN : %s:%dSESSION SIZE : %d\n", __FILE__, __LINE__, getGxSession()->getRules().size());
 
       //
       // see if the session exists in the database
@@ -898,6 +1063,7 @@ bool GxIpCan1::processPhase1()
          StatsPcrf::singleton().registerStatResult(stat_pcrf_gx_ccr, 0, DIAMETER_UNABLE_TO_COMPLY);
          ABORT();
       }
+		printf ("SOHAN : %s:%dSESSION SIZE : %d\n", __FILE__, __LINE__, getGxSession()->getRules().size());
 
       //
       // lookup the subscriber
@@ -937,6 +1103,7 @@ bool GxIpCan1::processPhase1()
             ABORT();
          }
       }
+		printf ("SOHAN : %s:%dSESSION SIZE : %d\n", __FILE__, __LINE__, getGxSession()->getRules().size());
 
       {
          /*
@@ -967,9 +1134,13 @@ bool GxIpCan1::processPhase1()
          //
          // assign the rules associated with the APN to the process list
          //
+
          getGxSession()->getRules() = sa->getComputedRules();
+			printf ("SOHAN : SESSION RULES LIST : %d\n", getGxSession()->getRules().size());
          getGxSession()->getRules().addGxSession( getGxSession() );
       }
+		printf ("SOHAN : %s:%dSESSION SIZE : %d\n", __FILE__, __LINE__, getGxSession()->getRules().size());
+#if 0
 
       //
       // get the PCRF endpoint
@@ -1010,7 +1181,8 @@ bool GxIpCan1::processPhase1()
 
           getGxSession()->setPcrfEndpoint( ep );
       }
-
+#endif
+		printf ("SOHAN : %s:%dSESSION SIZE : %d\n", __FILE__, __LINE__, getGxSession()->getRules().size());
       {
           uint8_t ipaddr[16];
           size_t ipaddrlen = sizeof(ipaddr);
@@ -1033,6 +1205,7 @@ bool GxIpCan1::processPhase1()
                   ABORT();
               }
           }
+			 printf ("SOHAN : %s:%dSESSION SIZE : %d\n", __FILE__, __LINE__, getGxSession()->getRules().size());
 
           ipaddrlen = sizeof(ipaddr);
           if ( getCCR().framed_ipv6_prefix.get( ipaddr, ipaddrlen ) )
@@ -1050,7 +1223,7 @@ bool GxIpCan1::processPhase1()
               ABORT();
           }
       }
-
+		printf ("SOHAN : %s:%dSESSION SIZE : %d\n", __FILE__, __LINE__, getGxSession()->getRules().size());
       //
       // get the PCEF supported features
       //
@@ -1085,8 +1258,8 @@ bool GxIpCan1::processPhase1()
 
           getGxSession()->setSupportedFeatures( supported_features );
       }
-
-#if 0
+		printf ("SOHAN : %s:%dSESSION SIZE : %d\n", __FILE__, __LINE__, getGxSession()->getRules().size());
+#if 1
       //
       // get the PCEF endpoint
       //
@@ -1097,8 +1270,16 @@ bool GxIpCan1::processPhase1()
           if ( !getPCRF().getEndpoint( s, ep ) )
           {
               ep = new Endpoint();
-              ep->setHost( Options::originHost() );
-              ep->setRealm( Options::originRealm() );
+              ep->setHost( s );
+				  std::string pcef_realm;
+				  if ( getCCR().origin_realm.get( pcef_realm ) )
+				  {
+				     ep->setRealm( pcef_realm );
+				  }
+				  else
+				  {
+                 ep->setRealm( Options::originRealm() );
+				  }
 
               if ( getPCRF().dataaccess().addEndpoint( *ep ) )
               {
@@ -1137,7 +1318,7 @@ bool GxIpCan1::processPhase1()
           ABORT();
       }
 #endif
-
+		printf ("SOHAN : %s:%dSESSION SIZE : %d\n", __FILE__, __LINE__, getGxSession()->getRules().size());
       //
       // get the TDF endpoint
       //
@@ -1208,6 +1389,8 @@ bool GxIpCan1::processPhase1()
       }
       else
       {
+			
+			printf ("SOHAN : %s:%dSESSION SIZE : %d\n", __FILE__, __LINE__, getGxSession()->getRules().size());
           //
           // set the TDF endpoint from the PcrfEndpoint
           //
@@ -1235,6 +1418,7 @@ bool GxIpCan1::processPhase1()
       //
       // get the TSSF endpoint
       //
+		printf ("SOHAN : %s:%dSESSION SIZE : %d\n", __FILE__, __LINE__, getGxSession()->getRules().size());
       if ( getGxSession()->getPcrfEndpoint() && !getGxSession()->getPcrfEndpoint()->getAssignedTssf().empty() )
       {
           Endpoint *ep = NULL;
@@ -1257,6 +1441,7 @@ bool GxIpCan1::processPhase1()
       //
       // setup Sy interface if needed
       //
+		printf ("SOHAN : %s:%dSESSION SIZE : %d\n", __FILE__, __LINE__, getGxSession()->getRules().size());
       {
          bool syRequired = getGxSession()->getApnEntry()->getSyRequired();
 
@@ -1283,6 +1468,7 @@ bool GxIpCan1::processPhase1()
       //
       // add the session to the database
       //
+		printf ("SOHAN : %s:%dSESSION SIZE : %d\n", __FILE__, __LINE__, getGxSession()->getRules().size());
       if ( !getPCRF().dataaccess().addSession( *getGxSession() ) )
       {
          Logger::gx().error( "%s:%d - Unable to add the session to the database imsi=[%s] apn=[%s]",
@@ -1296,6 +1482,7 @@ bool GxIpCan1::processPhase1()
       //
       // all the parsing work has been completed, so add the session to the session map
       //
+		printf ("SOHAN : %s:%dSESSION SIZE : %d\n", __FILE__, __LINE__, getGxSession()->getRules().size());
       if ( !GxSessionMap::getInstance().addSession( getGxSession() ) )
       {
          Logger::gx().error( "%s:%d - Unable to insert session into session map imsi=[%s] apn=[%s]",
@@ -1311,6 +1498,7 @@ bool GxIpCan1::processPhase1()
       //
       // establish the TDF session if necessary
       //
+		printf ("SOHAN : %s:%dSESSION SIZE : %d\n", __FILE__, __LINE__, getGxSession()->getRules().size());
       {
          m_sdEstablishSession = new SdIpCan1EstablishSession( getPCRF(), this );
          if ( !m_sdEstablishSession )
@@ -1324,6 +1512,7 @@ bool GxIpCan1::processPhase1()
          }
 
         printf("\n calling phase1 %s %d \n",__FUNCTION__, __LINE__);
+			printf ("SOHAN : %s:%dSESSION SIZE : %d\n", __FILE__, __LINE__, getGxSession()->getRules().size());
          if ( !m_sdEstablishSession->processPhase1() )
          {
             printf("\n phase1 return %s %d \n",__FUNCTION__, __LINE__);
@@ -1370,11 +1559,11 @@ bool GxIpCan1::processPhase1()
 	  if (getStatus() == esComplete)
 	  {
 	     // we have sent the successful CCA Initial, hence start the timer
-	    Logger::gx().debug("SOHAN STARTING THE TIMER AS CCA Initial is sent");
-		 m_idleTimer = new SEventThread::Timer(20, true);
-   	 initTimer( *m_idleTimer);
+	    Logger::gx().debug("STARTING THE TIMER AS CCA Initial is sent");
+		 m_rarTimer = new SEventThread::Timer(20000, true);
+   	 initTimer( *m_rarTimer);
 	  	 init(NULL);
-		 m_idleTimer->start();
+		 m_rarTimer->start();
 	  }
       break;
    }
@@ -1418,6 +1607,25 @@ bool GxIpCan1::processPhase2( bool lockit )
       return false;
    }
 
+	//printf ("SOHAN : SIZE OF GX Rule : %d\n", getGxSession()->getRules().size());
+	//printf ("SOHAN : SIZE OF GX INSTALL RULE : %d\n", getGxSession()->getInstalledRules().size());
+	/*
+	RulesMap &arules = getGxSession()->getPCRF().getRules();
+	RulesList* arulesl = new RulesList();
+	
+	for (auto ar : arules)
+	{
+		arulesl->push_back(ar.second);
+	}
+	getGxSession()->getRules() = (*arulesl);
+	*/
+
+	/*
+	for (auto arl : arulesl)
+	{
+		printf ("SOHAN : %s:%d RuleName : %s\n", __FILE__, __LINE__, arl->getRuleName().c_str());
+	}
+	*/
    bool result = getRulesEvaluator().evaluate(*getGxSession(), getGxSession()->getRules(),
          getGxSession()->getInstalledRules(), getGxSession()->getTdfSession().getInstalledRules(),
          getGxSession()->getTssfSession().getInstalledRules(), getGxSession()->getSubscriber().getFailOnUninstallableRule() );
@@ -1526,6 +1734,7 @@ bool GxIpCan1::processPhase3()
 
       if ( !irules.empty() )
       {
+			printf ("SOHAN : IRULES NOT EMPTY\n");
          int crcnt = 0;
          int pracnt = 0;
          FDAvp cri( getDict().avpChargingRuleInstall() );
@@ -1533,6 +1742,7 @@ bool GxIpCan1::processPhase3()
 
          for ( auto r : irules )
          {
+		 
             if ( r->getType() == "CHARGING" )
             {
                cri.addJson( r->getDefinition() );
@@ -1554,6 +1764,7 @@ bool GxIpCan1::processPhase3()
 
       if ( !rrules.empty() )
       {
+			printf ("SOHAN : R RULES NOT EMPTY\n");
          int crcnt = 0;
          int pracnt = 0;
          FDAvp crr( getDict().avpChargingRuleRemove() );

@@ -118,6 +118,7 @@ bool DataAccess::getRules( RulesMap &rules )
 
    while ( result && rows.nextRow() )
    {
+		int i = 0;
       SCassRow row = rows.row();
       Rule *r = new Rule();
 
@@ -143,8 +144,10 @@ bool DataAccess::getRules( RulesMap &rules )
          GET_EVENT_DATA2( row, sy_required, b, r->setSyRequired );
          GET_EVENT_DATA2( row, timemask, i64, r->setTimeMask );
          GET_EVENT_DATA2( row, featuremask, i64, r->setFeatureMask );
+         GET_EVENT_DATA2( row, defaultrule, b, r->setDefaultFlag );
 
          rules.insert( std::pair<std::string,Rule*>( r->getRuleName(), r ) );
+			printf ("SOHAN : DATAACCESS : RULES NAME : %s\n", r->getRuleName().c_str());
       }
       catch ( DAException &ex )
       {
@@ -162,8 +165,8 @@ bool DataAccess::getRules( RulesMap &rules )
          delete r;
          break;
       }
+		i++;
    }
-
    return result;
 }
 
@@ -204,6 +207,7 @@ bool DataAccess::getApns( ApnMap &apns, RulesMap &rules )
          if ( (apnit = apns.find(a->getApn())) != apns.end() )
          {
             // found the apn so must be a duplicate
+				printf ("SOHAN : DUPLICATE APN in DATABASE\n");
             Logger::system().error( "DataAccess::%s:%d - duplicate APN [%s] while loading",
                   __func__, __LINE__, s.c_str() );
             result = false;
@@ -233,6 +237,7 @@ bool DataAccess::getApns( ApnMap &apns, RulesMap &rules )
             else
             {
                // found the apn so must be a duplicate
+					printf ("SOHAN DUPLICATE ENTRY of RULE NAME: %s\n", rulename.c_str());
                Logger::system().error( "DataAccess::%s:%d - rule [%s] not found while loading APN [%s]",
                      __func__, __LINE__, s.c_str(), a->getApn().c_str() );
                result = false;
